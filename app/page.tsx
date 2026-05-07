@@ -76,7 +76,7 @@ function DropZone({ label, hint, accept, icon: Icon, file, onChange }: {
       {/* Label + hint */}
       <div>
         <div style={{ fontSize:'var(--tx-sm)', fontWeight:600, color:'var(--text)' }}>{label}</div>
-        <div style={{ fontSize:'var(--tx-xs)', color:'var(--text-faint)', marginTop:2 }}>{hint}</div>
+        <div style={{ fontSize:'var(--tx-xs)', color:'var(--text-muted)', marginTop:2 }}>{hint}</div>
       </div>
 
       {/* File info OR prompt */}
