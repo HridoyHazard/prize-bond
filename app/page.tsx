@@ -253,6 +253,7 @@ function DropZone({
       />
       <div className="dz-icon">{file ? <IconCheck /> : <Icon />}</div>
       <div>
+<<<<<<< HEAD
         <div
           style={{
             fontSize: "var(--tx-sm)",
@@ -271,6 +272,10 @@ function DropZone({
         >
           {hint}
         </div>
+=======
+        <div style={{ fontSize:'var(--tx-sm)', fontWeight:600, color:'var(--text)' }}>{label}</div>
+        <div style={{ fontSize:'var(--tx-xs)', color:'var(--text-muted)', marginTop:2 }}>{hint}</div>
+>>>>>>> c3843d1c2fe5f0d6130bc65de4ca387a76ee1bfe
       </div>
       {file ? (
         <div
