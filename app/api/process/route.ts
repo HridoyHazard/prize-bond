@@ -11,6 +11,7 @@ import {
 } from "@/lib/bengali-utils";
 
 // ✅ App Router segment config
+export const runtime = "nodejs";
 export const maxDuration = 60;
 export const dynamic = "force-dynamic";
 
