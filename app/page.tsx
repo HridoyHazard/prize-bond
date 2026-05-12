@@ -539,6 +539,69 @@ function ConfidenceLegend() {
   );
 }
 
+// ─── Step indicator for processing UI ────────────────────────────────────────
+const STEPS = [
+  "Parsing Excel file (browser)",
+  "Stage 1 — Tesseract OCR scan (browser)",
+  "Stage 2 — Groq AI correction (server)",
+  "Scoring & comparing",
+];
+
+function StepList({ currentStep }: { currentStep: number }) {
+  return (
+    <div
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        gap: 8,
+        width: "100%",
+        maxWidth: 280,
+      }}
+    >
+      {STEPS.map((s, i) => {
+        const done = i < currentStep;
+        const active = i === currentStep;
+        return (
+          <div
+            key={s}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 12,
+              fontSize: "var(--tx-xs)",
+              color: done
+                ? "var(--success)"
+                : active
+                  ? "var(--text)"
+                  : "var(--text-faint)",
+              transition: "color 0.3s",
+            }}
+          >
+            {done ? (
+              <span style={{ color: "var(--success)", display: "flex" }}>
+                <IconCheck />
+              </span>
+            ) : active ? (
+              <div className="step-spinner" />
+            ) : (
+              <div
+                style={{
+                  width: 8,
+                  height: 8,
+                  borderRadius: "50%",
+                  border: "1px solid var(--border)",
+                  flexShrink: 0,
+                }}
+              />
+            )}
+            <span>{s}</span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 // ─── Page ─────────────────────────────────────────────────────────────────────
 export default function Home() {
   const [excelFile, setExcelFile] = useState<File | null>(null);
@@ -547,6 +610,8 @@ export default function Home() {
   const [result, setResult] = useState<ComparisonResult | null>(null);
   const [ocrText, setOcrText] = useState("");
   const [error, setError] = useState("");
+  // -1 = not started, 0-3 = current step index, 4 = all done
+  const [currentStep, setCurrentStep] = useState(-1);
 
   const canProcess = excelFile && documentFile && status !== "processing";
 
@@ -557,6 +622,7 @@ export default function Home() {
     setResult(null);
     setOcrText("");
     setError("");
+    setCurrentStep(-1);
   };
 
   const process = async () => {
@@ -564,16 +630,105 @@ export default function Home() {
     setStatus("processing");
     setError("");
     setResult(null);
-    const fd = new FormData();
-    fd.append("excelFile", excelFile);
-    fd.append("documentFile", documentFile);
+    setCurrentStep(0);
+
     try {
-      const res = await fetch("/api/process", { method: "POST", body: fd });
+      // ── Step 0: Parse Excel in browser ─────────────────────────────────
+      const XLSX = await import("xlsx");
+      const { isBengaliNumber, isArabicNumber, bengaliToArabic } =
+        await import("@/lib/bengali-utils");
+
+      const excelBuffer = await excelFile.arrayBuffer();
+      const workbook = XLSX.read(excelBuffer, { type: "array" });
+      const sheet = workbook.Sheets[workbook.SheetNames[0]];
+      const rows = XLSX.utils.sheet_to_json<unknown[]>(sheet, { header: 1 });
+
+      const numbers: string[] = [];
+      for (const row of rows) {
+        for (const cell of row as unknown[]) {
+          const val = String(cell ?? "").trim();
+          if (isBengaliNumber(val)) {
+            numbers.push(bengaliToArabic(val));
+            continue;
+          }
+          if (isArabicNumber(val)) {
+            numbers.push(val);
+            continue;
+          }
+          if (/^\d+$/.test(val)) {
+            const padded = val.padStart(7, "0");
+            if (padded.length === 7) numbers.push(padded);
+          }
+        }
+      }
+      const excelNumbers = Array.from(new Set(numbers));
+
+      if (excelNumbers.length === 0) {
+        throw new Error("No 7-digit numbers found in the Excel file.");
+      }
+
+      const isPDF =
+        documentFile.type === "application/pdf" ||
+        documentFile.name.toLowerCase().endsWith(".pdf");
+
+      let tessRawText = "";
+      let imageBase64: string | undefined;
+
+      setCurrentStep(1);
+
+      if (isPDF) {
+        // ── PDF: extract Bengali text client-side ─────────────────────────
+        const pdfBuffer = await documentFile.arrayBuffer();
+        const bytes = new Uint8Array(pdfBuffer);
+        // decode as latin-1 to preserve byte values for Bengali unicode chunk regex
+        let latin1 = "";
+        const chunkSize = 8192;
+        for (let i = 0; i < bytes.length; i += chunkSize) {
+          latin1 += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+        }
+        const bengaliChunks = latin1.match(/[\u09E6-\u09EF০-৯]{4,}/g) ?? [];
+        tessRawText = bengaliChunks.join("\n");
+        // PDF path needs no Groq vision — skip to step 3
+        setCurrentStep(2);
+      } else {
+        // ── Image: run Tesseract in browser ──────────────────────────────
+        const { createWorker, PSM } = await import("tesseract.js");
+        const worker = await createWorker("ben", 1);
+        await worker.setParameters({
+          tessedit_pageseg_mode: PSM.SPARSE_TEXT,
+        });
+        const {
+          data: { text },
+        } = await worker.recognize(documentFile);
+        await worker.terminate();
+        tessRawText = text;
+
+        // Convert image to base64 data URL for Groq vision
+        imageBase64 = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result as string);
+          reader.onerror = reject;
+          reader.readAsDataURL(documentFile);
+        });
+
+        setCurrentStep(2);
+      }
+
+      // ── Step 2: Server handles Groq + comparison (fast, ~2s) ───────────
+      const res = await fetch("/api/process", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ excelNumbers, tessRawText, imageBase64 }),
+      });
+
+      setCurrentStep(3);
       const data: ProcessResponse = await res.json();
       if (!res.ok || !data.success)
         throw new Error(data.error ?? `Server error ${res.status}`);
+
       setResult(data.result!);
       setOcrText(data.ocrText ?? "");
+      setCurrentStep(4);
       setStatus("done");
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "Unknown error");
@@ -875,42 +1030,12 @@ export default function Home() {
                     marginTop: 4,
                   }}
                 >
-                  Running OCR and comparing numbers. This may take a moment.
+                  {currentStep <= 1
+                    ? "Running OCR in your browser — no upload needed."
+                    : "Sending to Groq AI for correction…"}
                 </p>
               </div>
-              <div
-                style={{
-                  display: "flex",
-                  flexDirection: "column",
-                  gap: 8,
-                  width: "100%",
-                  maxWidth: 240,
-                }}
-              >
-                {[
-                  "Parsing Excel file",
-                  "Stage 1 — Tesseract OCR scan",
-                  "Stage 2 — Groq AI correction",
-                  "Scoring & comparing",
-                ].map((s, i) => (
-                  <div
-                    key={s}
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      gap: 12,
-                      fontSize: "var(--tx-xs)",
-                      color: "var(--text-muted)",
-                    }}
-                  >
-                    <div
-                      className="step-spinner"
-                      style={{ animationDelay: `${i * 0.25}s` }}
-                    />
-                    <span>{s}</span>
-                  </div>
-                ))}
-              </div>
+              <StepList currentStep={currentStep} />
             </div>
           </div>
         )}
