@@ -1,135 +1,185 @@
-/**
- * POST /api/process
- *
- * Accepts a multipart form with:
- *   - excelFile: .xlsx file containing Bengali 7-digit numbers
- *   - documentFile: PDF or image file to OCR
- *
- * Returns: ComparisonResult JSON
- */
-
 import { NextRequest, NextResponse } from "next/server";
 import * as XLSX from "xlsx";
+import Tesseract, { PSM } from "tesseract.js";
 import {
-  extract7DigitNumbers,
-  bengaliToArabic,
+  extractBengaliNumbers,
+  scoreNumbers,
   compareNumbers,
-  type ComparisonResult,
+  bengaliToArabic,
+  isBengaliNumber,
+  isArabicNumber,
 } from "@/lib/bengali-utils";
 
-// URL of the Python OCR microservice (set via .env.local)
-const OCR_SERVICE_URL = process.env.OCR_SERVICE_URL ?? "http://localhost:8000";
+// ✅ App Router segment config
+export const maxDuration = 60;
+export const dynamic = "force-dynamic";
 
-// ─── Main Handler ─────────────────────────────────────────────────────────────
+// ─── Excel parser ─────────────────────────────────────────────────────────────
 
-export async function POST(request: NextRequest) {
+function parseExcel(buffer: ArrayBuffer): string[] {
+  const workbook = XLSX.read(buffer, { type: "array" });
+  const sheet = workbook.Sheets[workbook.SheetNames[0]];
+  const rows = XLSX.utils.sheet_to_json<unknown[]>(sheet, { header: 1 });
+
+  const numbers: string[] = [];
+
+  for (const row of rows) {
+    for (const cell of row as unknown[]) {
+      const val = String(cell ?? "").trim();
+
+      if (isBengaliNumber(val)) {
+        numbers.push(bengaliToArabic(val));
+        continue;
+      }
+      if (isArabicNumber(val)) {
+        numbers.push(val);
+        continue;
+      }
+      if (/^\d+$/.test(val)) {
+        const padded = val.padStart(7, "0");
+        if (padded.length === 7) numbers.push(padded);
+      }
+    }
+  }
+
+  return Array.from(new Set(numbers));
+}
+
+// ─── File → base64 data URL ───────────────────────────────────────────────────
+
+async function fileToBase64(file: File): Promise<string> {
+  const buffer = await file.arrayBuffer();
+  const b64 = Buffer.from(buffer).toString("base64");
+  const mime = file.type || "image/png";
+  return `data:${mime};base64,${b64}`;
+}
+
+// ─── Tesseract runner ────────────────────────────────────────────────────────
+
+async function runTesseract(
+  base64Image: string,
+): Promise<{ numbers: string[]; raw: string }> {
   try {
-    // 1. Parse uploaded files from the request
-    const formData = await request.formData();
+    const worker = await Tesseract.createWorker("ben", 1);
+    await worker.setParameters({
+      tessedit_pageseg_mode: PSM.SPARSE_TEXT,
+    });
+    const {
+      data: { text },
+    } = await worker.recognize(base64Image);
+    await worker.terminate();
+    return { numbers: extractBengaliNumbers(text), raw: text };
+  } catch {
+    return { numbers: [], raw: "" };
+  }
+}
+
+// ─── Groq runner ─────────────────────────────────────────────────────────────
+
+async function runGroq(
+  base64Image: string,
+  tesseractRaw: string,
+  host: string,
+): Promise<{ numbers: string[]; raw: string }> {
+  try {
+    const res = await fetch(`${host}/api/groq-ocr`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ imageBase64: base64Image, tesseractRaw }),
+    });
+    const data = await res.json();
+    if (data.error) return { numbers: [], raw: "" };
+    return { numbers: extractBengaliNumbers(data.raw), raw: data.raw };
+  } catch {
+    return { numbers: [], raw: "" };
+  }
+}
+
+// ─── PDF text extraction ─────────────────────────────────────────────────────
+
+async function extractFromPDF(buffer: ArrayBuffer): Promise<string> {
+  const text = Buffer.from(buffer).toString("latin1");
+  const bengaliChunks = text.match(/[\u09E6-\u09EF০-৯]{4,}/g) ?? [];
+  return bengaliChunks.join("\n");
+}
+
+// ─── Main POST handler ───────────────────────────────────────────────────────
+
+export async function POST(req: NextRequest) {
+  try {
+    const formData = await req.formData();
     const excelFile = formData.get("excelFile") as File | null;
     const documentFile = formData.get("documentFile") as File | null;
 
     if (!excelFile || !documentFile) {
       return NextResponse.json(
-        { error: "Both excelFile and documentFile are required." },
+        { success: false, error: "Both files are required." },
         { status: 400 },
       );
     }
 
-    // 2. Extract numbers from the Excel file
-    const excelNumbers = await extractNumbersFromExcel(excelFile);
+    // ── 1. Parse Excel ──────────────────────────────────────────────────────
+    const excelBuffer = await excelFile.arrayBuffer();
+    const excelNumbers = parseExcel(excelBuffer);
 
     if (excelNumbers.length === 0) {
       return NextResponse.json(
-        { error: "No 7-digit numbers found in the Excel file." },
+        {
+          success: false,
+          error: "No 7-digit numbers found in the Excel file.",
+        },
         { status: 422 },
       );
     }
 
-    // 3. Send document to OCR service and extract numbers
-    const ocrText = await getOcrText(documentFile);
-    const ocrNumbers = extract7DigitNumbers(ocrText);
+    const host = `${req.nextUrl.protocol}//${req.nextUrl.host}`;
 
-    // 4. Compare and return results
-    const result: ComparisonResult = compareNumbers(excelNumbers, ocrNumbers);
+    let ocrRawText: string = "";
+    let tessNumbers: string[] = [];
+    let groqNumbers: string[] = [];
 
-    return NextResponse.json({ success: true, result, ocrText });
-  } catch (err: unknown) {
-    console.error("[/api/process] Error:", err);
-    const message =
-      err instanceof Error ? err.message : "Unexpected server error.";
-    return NextResponse.json({ error: message }, { status: 500 });
-  }
-}
+    const isPDF =
+      documentFile.type === "application/pdf" ||
+      documentFile.name.toLowerCase().endsWith(".pdf");
 
-// ─── Excel Parser ─────────────────────────────────────────────────────────────
+    if (isPDF) {
+      // ── 2a. PDF path ──────────────────────────────────────────────────────
+      const pdfBuffer = await documentFile.arrayBuffer();
+      ocrRawText = await extractFromPDF(pdfBuffer);
+      tessNumbers = extractBengaliNumbers(ocrRawText);
+      groqNumbers = tessNumbers; // no vision needed for embedded text
+    } else {
+      // ── 2b. Image path — full dual-engine pipeline ────────────────────────
+      const base64Image = await fileToBase64(documentFile);
 
-/**
- * Reads an xlsx file and extracts all 7-digit numbers from every cell.
- * Handles both Bengali (০-৯) and Arabic (0-9) digit formats.
- */
-async function extractNumbersFromExcel(file: File): Promise<string[]> {
-  const arrayBuffer = await file.arrayBuffer();
-  const workbook = XLSX.read(arrayBuffer, { type: "array" });
+      // Stage 1: Tesseract
+      const tessResult = await runTesseract(base64Image);
+      tessNumbers = tessResult.numbers;
+      ocrRawText = tessResult.raw;
 
-  const allNumbers = new Set<string>();
-
-  for (const sheetName of workbook.SheetNames) {
-    const sheet = workbook.Sheets[sheetName];
-
-    // Convert sheet to an array of arrays (raw values)
-    const rows: unknown[][] = XLSX.utils.sheet_to_json(sheet, {
-      header: 1, // Use numeric headers → gives us raw rows
-      raw: false, // Get formatted strings, not raw numbers
-      defval: "", // Empty cells → empty string
-    });
-
-    for (const row of rows) {
-      for (const cell of row) {
-        if (cell === null || cell === undefined || cell === "") continue;
-
-        // Convert cell value to string for regex matching
-        const cellStr = String(cell).trim();
-
-        // Extract any 7-digit numbers from the cell (Bengali or Arabic)
-        const numbers = extract7DigitNumbers(cellStr);
-        for (const num of numbers) {
-          allNumbers.add(bengaliToArabic(num)); // normalize to Arabic
-        }
-
-        // Also handle cells that are numeric — Excel may store as plain number
-        // Check if the cell itself, when normalized, is exactly 7 digits
-        const normalized = bengaliToArabic(cellStr).replace(/\s/g, "");
-        if (/^\d{7}$/.test(normalized)) {
-          allNumbers.add(normalized);
-        }
-      }
+      // Stage 2: Groq corrects using Tesseract's raw output as context
+      const groqResult = await runGroq(base64Image, tessResult.raw, host);
+      groqNumbers = groqResult.numbers;
     }
+
+    // ── 3. Score confidence ─────────────────────────────────────────────────
+    const scoredNumbers = scoreNumbers(tessNumbers, groqNumbers);
+
+    // ── 4. Compare against Excel ────────────────────────────────────────────
+    const result = compareNumbers(excelNumbers, scoredNumbers);
+
+    return NextResponse.json({
+      success: true,
+      result,
+      ocrText: ocrRawText,
+    });
+  } catch (err: unknown) {
+    const message =
+      err instanceof Error ? err.message : "Internal server error";
+    console.error("[/api/process]", message);
+    return NextResponse.json(
+      { success: false, error: message },
+      { status: 500 },
+    );
   }
-
-  return Array.from(allNumbers);
-}
-
-// ─── OCR Client ───────────────────────────────────────────────────────────────
-
-/**
- * Sends a file to the Python OCR microservice and returns the extracted text.
- * The Python service handles both PDFs (via pdf2image) and images (via PIL).
- */
-async function getOcrText(file: File): Promise<string> {
-  const body = new FormData();
-  body.append("file", file, file.name);
-
-  const response = await fetch(`${OCR_SERVICE_URL}/ocr`, {
-    method: "POST",
-    body,
-  });
-
-  if (!response.ok) {
-    const detail = await response.text();
-    throw new Error(`OCR service error (${response.status}): ${detail}`);
-  }
-
-  const data = (await response.json()) as { text: string; pages?: number };
-  return data.text ?? "";
 }
